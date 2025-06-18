@@ -26,9 +26,29 @@ class AgentConfig(BaseSettings):
         description="代理服务器地址"
     )
     
+    # 翻译相关配置
     translation_api: str = Field(
-        default_factory=lambda: os.getenv("TRANSLATION_API", "baidu"), 
-        description="翻译API提供商"
+        default_factory=lambda: os.getenv("TRANSLATION_API", "qwen"), 
+        description="翻译API提供商 (qwen, baidu)"
+    )
+    
+    dashscope_api_key: str = Field(
+        default_factory=lambda: os.getenv("DASHSCOPE_API_KEY", ""),
+        description="DashScope API密钥"
+    )
+    
+    # 支持的语言映射
+    language_map: dict = Field(
+        default_factory=lambda: {
+            "Chinese": "zh",
+            "English": "en",
+            "Japanese": "ja",
+            "Korean": "ko",
+            "Thai": "th",
+            "French": "fr",
+            "German": "de"
+        },
+        description="语言名称到代码的映射"
     )
 
 # 创建全局配置实例

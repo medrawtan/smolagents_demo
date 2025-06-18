@@ -1,4 +1,12 @@
-from smolagents import ToolCollection, CodeAgent, LiteLLMModel
+import os
+import sys
+import argparse
+import gradio as gr
+from typing import List, Dict, Any, Optional, Union, Tuple
+from loguru import logger
+
+from smolagents import ToolCollection, CodeAgent, LiteLLMModel, GradioUI
+from medical_smolagent.tools.translation import translate, TranslationTool
 
 # 配置本地 Ollama 模型
 model = LiteLLMModel(
@@ -15,83 +23,269 @@ server_parameters = {
     "transport": "streamable-http"
 }
 
-def test_mcp_tools():
-    """测试MCP搜索工具"""
-    print("测试MCP搜索工具...")
-    
+def setup_logging():
+    """配置日志"""
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        level="INFO"
+    )
+
+def translate_response(response: Union[str, Dict, Any]) -> str:
+    """将响应翻译成中文"""
     try:
-        # 使用上下文管理器从MCP服务器加载工具集合
-        with ToolCollection.from_mcp(server_parameters, trust_remote_code=True) as tool_collection:
-            # 创建CodeAgent实例并使用从MCP服务器加载的工具
-            agent = CodeAgent(
-                tools=[*tool_collection.tools], 
-                add_base_tools=True, 
-                model=model
-            )
+        if isinstance(response, dict):
+            # 如果是字典，尝试提取text字段或转换为JSON字符串
+            text = response.get('text', str(response))
+        else:
+            text = str(response)
             
-            # 测试查询
-            test_queries = [
-                "糖尿病最新治疗方法",
-                "COVID-19 症状",
-                "心脏搭桥手术"
-            ]
+        # 如果已经是中文，直接返回
+        if any('\u4e00' <= char <= '\u9fff' for char in text):
+            return text
             
-            for query in test_queries:
-                print(f"\n{'='*50}")
-                print(f"测试查询: {query}")
-                
-                try:
-                    result = agent.run(query)
-                    print(f"\nMCP 搜索结果:")
-                    print(result)
-                except Exception as e:
-                    print(f"查询 '{query}' 时出错: {str(e)}")
-                
-                input("按 Enter 继续测试下一个查询...")
+        # 确保翻译工具已初始化
+        from medical_smolagent.tools.translation import translator
+        translator.initialize()
+            
+        # 调用翻译工具翻译成中文
+        translated = translator.translate(text, target_lang="Chinese")
+        return translated
     except Exception as e:
-        print(f"初始化测试环境时出错: {str(e)}")
+        logger.error(f"翻译响应时出错: {str(e)}")
+        return f"{text}\n\n(翻译失败: {str(e)})"
+
+def get_agent() -> CodeAgent:
+    """获取配置好的agent实例，并添加翻译功能"""
+    # 确保翻译工具已初始化
+    from medical_smolagent.tools.translation import translator
+    translator.initialize()
+    
+    with ToolCollection.from_mcp(server_parameters, trust_remote_code=True) as tool_collection:
+        # 创建原始agent
+        agent = CodeAgent(
+            tools=[*tool_collection.tools],
+            add_base_tools=True,
+            model=model
+        )
+        
+        # 保存原始的run方法
+        original_run = agent.run
+        
+        # 保存原始的final_answer函数
+        original_final_answer = getattr(agent, 'final_answer', None)
+        
+        # 定义翻译函数
+        def translate_text(text: str) -> str:
+            """翻译文本为中文"""
+            if not text or any('\u4e00' <= char <= '\u9fff' for char in text):
+                return text
+            try:
+                return translator.translate(text, target_lang="Chinese")
+            except Exception as e:
+                logger.error(f"翻译响应时出错: {str(e)}")
+                return f"{text}\n\n(翻译失败: {str(e)})"
+        
+        # 重写final_answer方法
+        def final_answer_with_translation(answer: str) -> str:
+            """包装final_answer，添加翻译功能"""
+            translated = translate_text(answer)
+            if original_final_answer:
+                return original_final_answer(translated)
+            return translated
+        
+        # 替换final_answer方法
+        if original_final_answer:
+            agent.final_answer = final_answer_with_translation
+        
+        # 重写run方法，添加翻译功能
+        def run_with_translation(query: str, *args, **kwargs) -> str:
+            try:
+                # 调用原始的run方法
+                response = original_run(query, *args, **kwargs)
+                
+                # 确保响应是字符串
+                if not isinstance(response, str):
+                    response = str(response)
+                
+                # 如果响应不是中文，尝试翻译
+                return translate_text(response)
+                
+            except Exception as e:
+                error_msg = f"执行查询时出错: {str(e)}"
+                logger.error(error_msg)
+                return error_msg
+        
+        # 替换run方法
+        agent.run = run_with_translation
+        
+        return agent
+
+def run_cli():
+    """运行命令行界面"""
+    print("\n医疗智能体初始化完成！")
+    print("输入您的问题，或输入 'exit' 退出")
+    
+    while True:
+        try:
+            query = input("\n> ").strip()
+            
+            if query.lower() in ['exit', 'quit', '退出']:
+                print("感谢使用医疗智能体，再见！")
+                break
+                
+            if not query:
+                continue
+            
+            print(f"\n处理中，请稍候...")
+            
+            try:
+                # 获取新的agent实例处理查询
+                agent = get_agent()
+                response = agent.run(query)
+                
+                # 确保响应是字符串
+                if not isinstance(response, str):
+                    response = str(response)
+                
+                print(f"\n{'='*80}")
+                print(f"问题: {query}")
+                print("-"*80)
+                print(f"回答: {response}")
+                print("="*80)
+                
+            except Exception as e:
+                error_msg = f"处理查询时出错: {str(e)}"
+                print(f"\n{error_msg}")
+                logger.error(error_msg)
+            
+        except KeyboardInterrupt:
+            print("\n检测到中断信号，正在退出...")
+            break
+
+def run_gradio():
+    """运行Gradio Web界面"""
+    try:
+        # 创建Gradio界面
+        with gr.Blocks(title="医疗智能体") as demo:
+            gr.Markdown("# 医疗智能体")
+            gr.Markdown("输入您的医疗相关问题，智能体将为您提供专业解答。")
+            
+            with gr.Row():
+                chatbot = gr.Chatbot(label="对话历史")
+                
+            with gr.Row():
+                msg = gr.Textbox(
+                    label="输入您的问题",
+                    placeholder="请输入您的医疗问题...",
+                    lines=3
+                )
+                
+            with gr.Row():
+                submit_btn = gr.Button("提交")
+                clear_btn = gr.Button("清空对话")
+            
+            def respond(message: str, chat_history: List[Tuple[str, str]] = None) -> Tuple[str, List[Tuple[str, str]]]:
+                """处理用户输入并返回响应"""
+                if chat_history is None:
+                    chat_history = []
+                    
+                try:
+                    # 显示用户消息
+                    chat_history.append((message, None))
+                    
+                    # 获取新的agent实例处理查询
+                    agent = get_agent()
+                    
+                    # 处理查询并获取响应
+                    response = agent.run(message)
+                    
+                    # 确保响应是字符串
+                    if not isinstance(response, str):
+                        response = str(response)
+                    
+                    # 更新聊天历史
+                    chat_history[-1] = (message, response)
+                    
+                    return "", chat_history
+                    
+                except Exception as e:
+                    error_msg = f"处理请求时出错: {str(e)}"
+                    logger.error(error_msg)
+                    chat_history[-1] = (message, error_msg)
+                    return "", chat_history
+            
+            # 设置事件处理
+            msg.submit(respond, [msg, chatbot], [msg, chatbot])
+            submit_btn.click(respond, [msg, chatbot], [msg, chatbot])
+            clear_btn.click(lambda: [], None, chatbot, queue=False)
+            
+            # 添加自定义CSS
+            demo.css = """
+            .gradio-container {
+                max-width: 900px !important;
+                margin: 0 auto !important;
+            }
+            """
+            
+        # 启动Gradio界面
+        print("\n正在启动Web界面，请稍候...")
+        print("如果浏览器没有自动打开，请访问: http://localhost:7860")
+        demo.launch(
+            share=False, 
+            server_name="0.0.0.0", 
+            server_port=7860,
+            show_error=True
+        )
+        
+    except Exception as e:
+        error_msg = f"启动Gradio界面时出错: {str(e)}"
+        logger.error(error_msg)
+        print(f"\n错误: {error_msg}")
+        raise
 
 def main():
     """主函数"""
-    try:
-        # 测试MCP工具
-        test_mcp_tools()
-        
-        print("\n医疗智能体初始化完成！")
-        print("输入您的问题，或输入 'exit' 退出")
-        
-        # 交互式循环
-        while True:
-            try:
-                query = input("\n> ").strip()
-                
-                if query.lower() in ['exit', 'quit', '退出']:
-                    print("感谢使用医疗智能体，再见！")
-                    break
-                    
-                if not query:
-                    continue
-                
-                # 使用MCP工具处理查询
-                with ToolCollection.from_mcp(server_parameters, trust_remote_code=True) as tool_collection:
-                    # 创建新的agent实例，确保每次查询都是独立的
-                    agent = CodeAgent(
-                        tools=[*tool_collection.tools], 
-                        add_base_tools=True, 
-                        model=model
-                    )
-                    print(f"\n处理查询: {query}")
-                    response = agent.run(query)
-                    print(f"\n{response}")
-                
-            except KeyboardInterrupt:
-                print("\n检测到中断信号，正在退出...")
-                break
-            except Exception as e:
-                print(f"\n处理查询时出错: {str(e)}")
+    # 设置日志
+    setup_logging()
     
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='医疗智能体')
+    parser.add_argument('--mode', type=str, choices=['cli', 'web'], default='cli',
+                      help='运行模式: cli(命令行) 或 web(网页界面)')
+    parser.add_argument('--port', type=int, default=7860,
+                      help='Web服务器端口 (默认: 7860)')
+    parser.add_argument('--host', type=str, default='0.0.0.0',
+                      help='Web服务器监听地址 (默认: 0.0.0.0)')
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.mode == 'web':
+            print("\n=== 医疗智能体 Web 界面 ===")
+            print(f"服务器将运行在: http://{args.host}:{args.port}")
+            print("按 Ctrl+C 停止服务器\n")
+            
+            # 设置环境变量，供Gradio使用
+            os.environ['GRADIO_SERVER_NAME'] = args.host
+            os.environ['GRADIO_SERVER_PORT'] = str(args.port)
+            
+            run_gradio()
+        else:
+            print("\n=== 医疗智能体 命令行模式 ===")
+            print("输入您的问题，智能体会自动搜索最新医学信息并翻译成中文回答。")
+            print("输入 'exit' 或按 Ctrl+C 退出\n")
+            run_cli()
+            
+    except KeyboardInterrupt:
+        print("\n\n检测到中断信号，正在退出...")
     except Exception as e:
-        print(f"程序运行出错: {str(e)}")
+        logger.error(f"程序运行出错: {str(e)}")
+        print(f"\n错误: 程序运行出错，请检查日志获取详细信息")
+        sys.exit(1)
+    finally:
+        print("\n感谢使用医疗智能体，再见！")
 
 if __name__ == "__main__":
     main()
