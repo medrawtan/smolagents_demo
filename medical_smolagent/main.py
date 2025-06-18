@@ -34,27 +34,70 @@ def setup_logging():
 
 def translate_response(response: Union[str, Dict, Any]) -> str:
     """将响应翻译成中文"""
+    if isinstance(response, dict):
+        text = response.get('text', str(response))
+    else:
+        text = str(response)
+        
+    if not text.strip():
+        return text
+        
+    # 检测语言
+    from medical_smolagent.tools.translation import LanguageDetector
+    detected_lang = LanguageDetector.detect_language(text)
+    logger.info(f"Detected language: {detected_lang}")
+    
+    # 如果不是中文，则翻译
+    if detected_lang != "Chinese":
+        logger.info(f"Translating from {detected_lang} to Chinese")
+        try:
+            from medical_smolagent.tools.translation import translator
+            translated = translator.translate(text, source_lang=detected_lang, target_lang="Chinese")
+            return translated
+        except Exception as e:
+            logger.error(f"Error in translate_response: {str(e)}", exc_info=True)
+            return f"{text}\n\n(翻译失败: {str(e)})"
+            
+    return text
+
+# 全局变量，用于保持MCP连接
+_global_tool_collection = None
+_global_tools = []  # 初始化为空列表
+
+def initialize_mcp_tools() -> bool:
+    """初始化MCP工具集合"""
+    global _global_tool_collection, _global_tools
+    
+    if _global_tool_collection is not None:
+        return True  # 已经初始化
+        
     try:
-        if isinstance(response, dict):
-            # 如果是字典，尝试提取text字段或转换为JSON字符串
-            text = response.get('text', str(response))
+        logger.info("Initializing MCP tool collection...")
+        logger.debug(f"Using server parameters: {server_parameters}")
+        
+        # 创建工具集合
+        _global_tool_collection = ToolCollection.from_mcp(
+            server_parameters, 
+            trust_remote_code=True
+        )
+        
+        # 进入上下文
+        context = _global_tool_collection.__enter__()
+        logger.debug(f"MCP context entered: {context}")
+        
+        # 获取工具列表
+        if hasattr(_global_tool_collection, 'tools'):
+            _global_tools = list(_global_tool_collection.tools)  # 转换为列表并保存
+            logger.info(f"MCP tool collection initialized successfully with {len(_global_tools)} tools")
+            return True
         else:
-            text = str(response)
+            logger.error("MCP tool collection has no 'tools' attribute")
+            return False
             
-        # 如果已经是中文，直接返回
-        if any('\u4e00' <= char <= '\u9fff' for char in text):
-            return text
-            
-        # 确保翻译工具已初始化
-        from medical_smolagent.tools.translation import translator
-        translator.initialize()
-            
-        # 调用翻译工具翻译成中文
-        translated = translator.translate(text, target_lang="Chinese")
-        return translated
     except Exception as e:
-        logger.error(f"翻译响应时出错: {str(e)}")
-        return f"{text}\n\n(翻译失败: {str(e)})"
+        logger.error(f"Failed to initialize MCP tool collection: {str(e)}", exc_info=True)
+        _global_tools = []
+        return False
 
 def get_agent() -> CodeAgent:
     """获取配置好的agent实例，并添加翻译功能"""
@@ -62,65 +105,67 @@ def get_agent() -> CodeAgent:
     from medical_smolagent.tools.translation import translator
     translator.initialize()
     
-    with ToolCollection.from_mcp(server_parameters, trust_remote_code=True) as tool_collection:
-        # 创建原始agent
-        agent = CodeAgent(
-            tools=[*tool_collection.tools],
-            add_base_tools=True,
-            model=model
-        )
-        
-        # 保存原始的run方法
-        original_run = agent.run
-        
-        # 保存原始的final_answer函数
-        original_final_answer = getattr(agent, 'final_answer', None)
-        
-        # 定义翻译函数
-        def translate_text(text: str) -> str:
-            """翻译文本为中文"""
-            if not text or any('\u4e00' <= char <= '\u9fff' for char in text):
-                return text
-            try:
-                return translator.translate(text, target_lang="Chinese")
-            except Exception as e:
-                logger.error(f"翻译响应时出错: {str(e)}")
-                return f"{text}\n\n(翻译失败: {str(e)})"
-        
-        # 重写final_answer方法
-        def final_answer_with_translation(answer: str) -> str:
-            """包装final_answer，添加翻译功能"""
-            translated = translate_text(answer)
-            if original_final_answer:
-                return original_final_answer(translated)
-            return translated
-        
-        # 替换final_answer方法
+    # 初始化MCP工具
+    initialize_mcp_tools()
+    
+    # 创建原始agent
+    agent = CodeAgent(
+        tools=_global_tools,  # 使用缓存的工具列表
+        add_base_tools=True,
+        model=model
+    )
+    
+    # 保存原始的run方法
+    original_run = agent.run
+    
+    # 保存原始的final_answer函数
+    original_final_answer = getattr(agent, 'final_answer', None)
+    
+    # 定义翻译函数
+    def translate_text(text: str) -> str:
+        """翻译文本为中文"""
+        if not text or any('\u4e00' <= char <= '\u9fff' for char in text):
+            return text
+        try:
+            return translator.translate(text, target_lang="Chinese")
+        except Exception as e:
+            logger.error(f"翻译响应时出错: {str(e)}")
+            return f"{text}\n\n(翻译失败: {str(e)})"
+    
+    # 重写final_answer方法
+    def final_answer_with_translation(answer: str) -> str:
+        """包装final_answer，添加翻译功能"""
+        translated = translate_text(answer)
         if original_final_answer:
-            agent.final_answer = final_answer_with_translation
-        
-        # 重写run方法，添加翻译功能
-        def run_with_translation(query: str, *args, **kwargs) -> str:
-            try:
-                # 调用原始的run方法
-                response = original_run(query, *args, **kwargs)
-                
-                # 确保响应是字符串
-                if not isinstance(response, str):
-                    response = str(response)
-                
-                # 如果响应不是中文，尝试翻译
-                return translate_text(response)
-                
-            except Exception as e:
-                error_msg = f"执行查询时出错: {str(e)}"
-                logger.error(error_msg)
-                return error_msg
-        
-        # 替换run方法
-        agent.run = run_with_translation
-        
-        return agent
+            return original_final_answer(translated)
+        return translated
+    
+    # 替换final_answer方法
+    if original_final_answer:
+        agent.final_answer = final_answer_with_translation
+    
+    # 重写run方法，添加翻译功能
+    def run_with_translation(query: str, *args, **kwargs) -> str:
+        try:
+            # 调用原始的run方法
+            response = original_run(query, *args, **kwargs)
+            
+            # 确保响应是字符串
+            if not isinstance(response, str):
+                response = str(response)
+            
+            # 如果响应不是中文，尝试翻译
+            return translate_text(response)
+            
+        except Exception as e:
+            error_msg = f"执行查询时出错: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+    
+    # 替换run方法
+    agent.run = run_with_translation
+    
+    return agent
 
 def run_cli():
     """运行命令行界面"""

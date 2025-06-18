@@ -6,21 +6,58 @@ from loguru import logger
 from medical_smolagent import config
 
 class LanguageDetector:
-    """Simple language detector based on character sets"""
-    @staticmethod
-    def detect_language(text: str) -> str:
-        """Detect if text is Chinese, Japanese, Korean, or Western language"""
-        # Check for Chinese characters
-        if re.search(r'[\u4e00-\u9fff]', text):
-            return "Chinese"
+    """Language detector based on character sets with improved CJK differentiation"""
+    
+    # Common Chinese characters that are not used in Japanese
+    CHINESE_ONLY_CHARS = r'[\u4e00-\u9fff]'
+    
+    # Japanese specific characters (Hiragana, Katakana, and some Japanese-specific Kanji)
+    JAPANESE_HIRAGANA = r'[\u3040-\u309F]'  # Hiragana
+    JAPANESE_KATAKANA = r'[\u30A0-\u30FF]'  # Katakana
+    JAPANESE_PUNCTUATION = r'[\u3000-\u303F]'  # Japanese punctuation
+    JAPANESE_KANA = JAPANESE_HIRAGANA + JAPANESE_KATAKANA
+    
+    # Korean characters
+    KOREAN_CHARS = r'[\uAC00-\uD7A3]'
+    
+    @classmethod
+    def detect_language(cls, text: str) -> str:
+        """
+        Detect the language of the given text with improved accuracy for CJK languages.
+        
+        Args:
+            text: The text to analyze
             
-        # Check for Japanese characters (Hiragana, Katakana, Kanji)
-        if re.search(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9faf\u3000-\u303f\uff00-\uff9f]', text):
+        Returns:
+            str: Detected language (Chinese, Japanese, Korean, or English)
+        """
+        if not text.strip():
+            return "English"
+            
+        # Check for Japanese specific characters first
+        has_hiragana = bool(re.search(cls.JAPANESE_HIRAGANA, text))
+        has_katakana = bool(re.search(cls.JAPANESE_KATAKANA, text))
+        has_jp_punctuation = bool(re.search(cls.JAPANESE_PUNCTUATION, text))
+        
+        # If text contains Hiragana or Katakana, it's definitely Japanese
+        if has_hiragana or has_katakana:
             return "Japanese"
             
-        # Check for Korean characters
-        if re.search(r'[\uac00-\ud7a3]', text):
+        # Check for Korean
+        if re.search(cls.KOREAN_CHARS, text):
             return "Korean"
+            
+        # Check for Chinese characters
+        has_chinese = bool(re.search(cls.CHINESE_ONLY_CHARS, text))
+        
+        # If we have Chinese characters and no Japanese indicators, it's likely Chinese
+        if has_chinese and not (has_hiragana or has_katakana or has_jp_punctuation):
+            # Additional check for Japanese punctuation which might indicate Japanese text
+            return "Chinese"
+            
+        # If we have Chinese characters but also Japanese punctuation, it might be Japanese
+        if has_chinese and has_jp_punctuation:
+            return "Japanese"
             
         # Default to English for other cases
         return "English"
@@ -44,33 +81,33 @@ class TranslationTool:
                     import httpx
                     import os
                     
-                    # 创建自定义的transport，明确设置不使用代理
+                    # 创建自定义的transport，完全绕过系统代理
                     class NoProxyTransport(httpx.HTTPTransport):
                         def handle_request(
                             self,
                             request: httpx.Request,
                         ) -> httpx.Response:
-                            # 保存原始的代理设置
-                            original_proxies = request.extensions.get("proxies")
-                            # 强制设置不使用代理
+                            # 确保请求头中没有代理相关的设置
+                            if 'proxy' in request.headers:
+                                del request.headers['proxy']
+                            if 'Proxy-Connection' in request.headers:
+                                del request.headers['Proxy-Connection']
+                            # 确保请求不使用代理
                             request.extensions["proxies"] = {}
-                            try:
-                                return super().handle_request(request)
-                            finally:
-                                # 恢复原始的代理设置（虽然不太可能被用到）
-                                if original_proxies is not None:
-                                    request.extensions["proxies"] = original_proxies
+                            return super().handle_request(request)
                     
-                    # 创建自定义的HTTP客户端
+                    # 创建自定义的HTTP客户端，确保不使用系统代理
                     transport = NoProxyTransport(
                         verify=False,  # 禁用SSL验证
-                        retries=3  # 重试次数
+                        retries=3,  # 重试次数
+                        proxy=None  # 显式禁用代理
                     )
                     
-                    # 创建HTTP客户端
+                    # 创建HTTP客户端，确保不继承系统代理设置
                     http_client = httpx.Client(
                         timeout=30.0,
-                        transport=transport
+                        transport=transport,
+                        trust_env=False  # 不信任环境变量中的代理设置
                     )
                     
                     # 初始化OpenAI客户端
@@ -126,7 +163,7 @@ class TranslationTool:
             # 自动检测源语言
             if not source_lang:
                 source_lang = LanguageDetector.detect_language(text)
-                self.logger.debug(f"Detected source language: {source_lang}")
+                self.logger.info(f"Detected source language: {source_lang}")
             
             # 准备翻译选项
             translation_options = {
@@ -138,20 +175,66 @@ class TranslationTool:
             # 调用翻译API
             messages = [{"role": "user", "content": text}]
             
-            response = self.client.chat.completions.create(
-                model="qwen-mt-turbo",
-                messages=messages,
-                extra_body={"translation_options": translation_options}
-            )
-            
-            translated_text = response.choices[0].message.content
-            self.logger.debug(f"Translated from {source_lang} to {target_lang}: {text[:50]}... -> {translated_text[:50]}...")
-            
-            return translated_text
+            try:
+                self.logger.info(f"Sending translation request to DashScope: {text[:100]}...")
+                
+                # 打印请求详情以便调试
+                request_data = {
+                    "model": "qwen-mt-turbo",
+                    "messages": messages,
+                    "extra_body": {"translation_options": translation_options}
+                }
+                self.logger.debug(f"Request data: {request_data}")
+                
+                # 发送请求
+                response = self.client.chat.completions.create(
+                    model="qwen-mt-turbo",
+                    messages=messages,
+                    extra_body={"translation_options": translation_options},
+                    timeout=30.0
+                )
+                
+                self.logger.debug(f"Raw API response: {response}")
+                
+                if not response.choices or not response.choices[0].message:
+                    error_msg = "Empty or invalid response from translation API"
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg)
+                    
+                translated_text = response.choices[0].message.content
+                
+                if not translated_text or translated_text.strip() == text.strip():
+                    self.logger.warning("Translation returned the same text as input")
+                
+                self.logger.info(f"Successfully translated from {source_lang} to {target_lang}")
+                self.logger.debug(f"Translation result: {text[:50]}... -> {translated_text[:50]}...")
+                
+                return translated_text
+                
+            except Exception as e:
+                error_msg = f"Translation API call failed: {str(e)}"
+                self.logger.error(error_msg, exc_info=True)  # 记录完整的堆栈跟踪
+                self.logger.error(f"Request details - Text: {text}, Source: {source_lang}, Target: {target_lang}")
+                
+                # 尝试获取更多错误信息
+                if hasattr(e, 'response'):
+                    try:
+                        if hasattr(e.response, 'text'):
+                            self.logger.error(f"API Error Response: {e.response.text}")
+                        if hasattr(e.response, 'status_code'):
+                            self.logger.error(f"API Status Code: {e.response.status_code}")
+                        if hasattr(e.response, 'headers'):
+                            self.logger.error(f"API Response Headers: {dict(e.response.headers)}")
+                    except Exception as inner_e:
+                        self.logger.error(f"Error while extracting error details: {str(inner_e)}")
+                
+                # 返回原始文本而不是抛出异常，确保应用程序继续运行
+                return f"{text}\n\n(Translation failed: {error_msg})"
             
         except Exception as e:
-            self.logger.error(f"Translation failed: {str(e)}")
-            return f"{text}\n\n(Translation failed: {str(e)})"
+            error_msg = f"Translation failed: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            return f"{text}\n\n({error_msg})"
     
     def _is_target_language(self, text: str, target_lang: str) -> bool:
         """Check if text is in the target language"""
